@@ -1,0 +1,438 @@
+ARDUINO CODE- 
+#include <DHT.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <LiquidCrystal_I2C.h>
+
+
+
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+#define OLED_ADDRESS 0x3C
+
+
+
+
+#define LCD_ADDRESS 0x27
+#define LCD_COLUMNS 16
+#define LCD_ROWS 2
+
+
+
+
+// Updated pin assignments
+#define DHTPIN 3          // DHT11 sensor on D3
+#define DHTTYPE DHT11
+#define SOIL_PIN A0       // Soil moisture sensor on A0
+#define RELAY_PIN 4       // Relay control on D4
+#define BUZZER_PIN 2      // Buzzer on D2
+#define TRIG_PIN 5        // Ultrasonic sensor trigger pin on D5
+#define ECHO_PIN 6        // Ultrasonic sensor echo pin on D6
+
+
+
+
+DHT dht(DHTPIN, DHTTYPE);
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+LiquidCrystal_I2C lcd(LCD_ADDRESS, LCD_COLUMNS, LCD_ROWS);
+
+
+
+
+const int DRY_VALUE = 300;
+const int WET_VALUE = 850;
+
+
+
+
+//Ultrasonic sensor constants (in cm)
+long duration;
+float distance;
+const float maxDistance = 18.5; // Maximum distance in cm
+
+
+
+
+// Thresholds for water levels
+const float lowThreshold = 6.16;   // Below this is "full" water
+const float mediumThreshold = 14.0; // Below this is "medium" water
+
+
+
+
+// Buzzer settings
+const int BUZZER_FREQUENCY = 2000;  // 2kHz for clear audible sound
+const int BEEP_DURATION = 300;      // Duration of each beep in milliseconds
+const int BEEP_PAUSE = 300;         // Pause between beeps in milliseconds
+
+
+
+
+// Configurable alert interval (default: 1 minute = 60000ms)
+unsigned long ALERT_INTERVAL = 60000; // Can be adjusted
+
+
+
+
+// Add variables for text scrolling
+String bottomMessage = "";
+int scrollPosition = 0;
+unsigned long lastScrollTime = 0;
+const unsigned long SCROLL_INTERVAL = 400; // Scroll speed in milliseconds
+
+
+
+
+// Add variables for buzzer functionality
+unsigned long lastAlertBeep = 0;
+
+
+
+
+int soilMoisture = 0;
+float waterDistance = 0;       // Raw distance from ultrasonic in cm
+String waterLevelStatus = ""; // Water level status (Full, Medium, Low)
+float temperature = 0;
+float humidity = 0;
+bool relayState = false;
+unsigned long lastSensorUpdate = 0;
+const unsigned long SENSOR_UPDATE_INTERVAL = 2000;
+
+
+
+
+void setup() {
+  Serial.begin(9600);
+  dht.begin();
+ 
+  pinMode(RELAY_PIN, OUTPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+ 
+  digitalWrite(RELAY_PIN, LOW);
+  digitalWrite(BUZZER_PIN, LOW);
+  digitalWrite(TRIG_PIN, LOW);
+
+
+
+
+  if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDRESS)) {
+    Serial.println(F("SSD1306 allocation failed"));
+    for (;;);
+  }
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+ 
+  lcd.begin(LCD_COLUMNS, LCD_ROWS);
+  lcd.backlight();
+  lcd.clear();
+ 
+  // Initial startup sound to confirm buzzer works
+  beepStartup();
+}
+
+
+
+
+void loop() {
+  checkRelayCommands();
+  checkAlertBeeper();
+
+
+
+
+  unsigned long currentMillis = millis();
+  if (currentMillis - lastSensorUpdate >= SENSOR_UPDATE_INTERVAL) {
+    readSensors();
+    updateOLED();
+    bottomMessage = getPlantStatusMessage(soilMoisture);
+    sendDataToESP32();
+    lastSensorUpdate = currentMillis;
+  }
+ 
+  // Update LCD with scrolling
+  updateLCD();
+}
+
+
+
+
+// Modified function to read ultrasonic sensor (in cm)
+float readUltrasonicDistance() {
+  // Clear the trigPin
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+ 
+  // Set the trigPin HIGH for 10 microseconds
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+ 
+  // Read the echoPin, return sound wave travel time in microseconds
+  duration = pulseIn(ECHO_PIN, HIGH, 30000); // Added timeout of 30000 microseconds (30ms)
+ 
+  // Check if sensor timed out (couldn't detect anything)
+  if (duration == 0) {
+    return 0; // This will be treated as FULL
+  } else {
+    // Calculate the distance
+    float dist = duration * 0.034 / 2; // Speed of sound wave divided by 2
+   
+    // Cap the distance at maximum value
+    if (dist > maxDistance) {
+      dist = maxDistance;
+    }
+   
+    return dist;
+  }
+}
+
+
+
+
+void readSensors() {
+  // Read temperature and humidity with error checking
+  float newTemp = dht.readTemperature();
+  float newHumidity = dht.readHumidity();
+ 
+  if (!isnan(newTemp)) temperature = newTemp;
+  if (!isnan(newHumidity)) humidity = newHumidity;
+ 
+  soilMoisture = analogRead(SOIL_PIN);
+ 
+  // Read ultrasonic sensor for water level
+  waterDistance = readUltrasonicDistance();
+ 
+  // Determine water level status
+  waterLevelStatus = getWaterLevelStatus(waterDistance);
+}
+
+
+
+
+void updateOLED() {
+  display.clearDisplay();
+  display.setCursor(0, 0);
+ 
+  // Temperature
+  display.print(F("Temp: "));
+  display.print(temperature, 1);
+  display.println(F("C"));
+ 
+  // Humidity
+  display.print(F("Humidity: "));
+  display.print(humidity, 1);
+  display.println(F("%"));
+ 
+  display.println();
+  display.print(F("Soil: "));
+  display.println(getSoilMoistureStatus(soilMoisture));
+ 
+  display.println();
+  display.print(F("Water: "));
+  display.print(waterLevelStatus);
+  display.print(" (");
+  // Calculate percentage for display
+  int waterPercent = 0;
+  if (waterDistance >= mediumThreshold) {
+    waterPercent = 25; // Low water
+  } else if (waterDistance >= lowThreshold) {
+    waterPercent = 75; // Medium water
+  } else {
+    waterPercent = 100; // Full water
+  }
+  display.print(waterPercent);
+  display.println("%)");
+ 
+  display.print(F("Pump: "));
+  display.println(relayState ? F("ON") : F("OFF"));
+ 
+  // Display alert interval in seconds
+  display.print(F("Alert: "));
+  display.print(ALERT_INTERVAL / 1000);
+  display.println(F("s"));
+ 
+  display.display();
+}
+
+
+
+
+void updateLCD() {
+  unsigned long currentMillis = millis();
+ 
+  // Top line (static)
+  lcd.setCursor(0, 0);
+  lcd.print("Temp: ");
+  lcd.print(temperature, 1);
+  lcd.print("C");
+ 
+  // Only scroll if enough time has passed
+  if (currentMillis - lastScrollTime >= SCROLL_INTERVAL) {
+    lastScrollTime = currentMillis;
+   
+    // Pad the message to ensure smooth scrolling
+    String paddedMessage = bottomMessage + "    " + bottomMessage;
+   
+    // Update bottom line (scrolling)
+    lcd.setCursor(0, 1);
+    lcd.print(paddedMessage.substring(scrollPosition, scrollPosition + LCD_COLUMNS));
+   
+    // Update scroll position
+    scrollPosition++;
+    if (scrollPosition >= bottomMessage.length() + 4) { // Reset after message + padding
+      scrollPosition = 0;
+    }
+  }
+}
+
+
+
+
+void checkAlertBeeper() {
+  unsigned long currentMillis = millis();
+ 
+  // Beep pattern based on water level according to the specified interval
+  if (currentMillis - lastAlertBeep >= ALERT_INTERVAL) {
+    if (waterLevelStatus == "Low") {
+      // 3 beeps for low water
+      beep(3);
+    } else if (waterLevelStatus == "Medium") {
+      // 2 beeps for medium water
+      beep(2);
+    } else { // Full
+      // 1 beep for full water
+      beep(1);
+    }
+   
+    lastAlertBeep = currentMillis;
+  }
+}
+
+
+
+
+// Enhanced beep function using tone() for louder sound
+void beep(int times) {
+  for (int i = 0; i < times; i++) {
+    // Use tone() for louder sound
+    tone(BUZZER_PIN, BUZZER_FREQUENCY, BEEP_DURATION);
+    delay(BEEP_DURATION);
+    noTone(BUZZER_PIN);
+   
+    if (i < times - 1) {
+      delay(BEEP_PAUSE);
+    }
+  }
+}
+
+
+
+
+// Startup sound to confirm buzzer working
+void beepStartup() {
+  // Ascending tones to indicate system startup
+  for (int freq = 1000; freq < 3000; freq += 500) {
+    tone(BUZZER_PIN, freq, 100);
+    delay(120);
+  }
+  noTone(BUZZER_PIN);
+}
+
+
+
+
+void sendDataToESP32() {
+  Serial.print("T:");
+  Serial.println(temperature);
+  delay(50);
+ 
+  Serial.print("H:");
+  Serial.println(round(humidity));
+  delay(50);
+ 
+  Serial.print("S:");
+  Serial.println(soilMoisture);
+  delay(50);
+ 
+  // Send water level data with status
+  Serial.print("U:");
+  // Calculate percentage for sending to ESP32
+  int waterPercent = 0;
+  if (waterDistance >= mediumThreshold) {
+    waterPercent = 25; // Low water
+  } else if (waterDistance >= lowThreshold) {
+    waterPercent = 75; // Medium water
+  } else {
+    waterPercent = 100; // Full water
+  }
+  Serial.print(waterPercent);
+  Serial.print("|");
+  Serial.println(waterLevelStatus);
+}
+
+
+
+
+void checkRelayCommands() {
+  while (Serial.available()) {
+    String command = Serial.readStringUntil('\n');
+   
+    // Handle relay commands
+    if (command.startsWith("R:")) {
+      relayState = command.substring(2).toInt() == 1;
+      digitalWrite(RELAY_PIN, relayState);
+      Serial.print("ACK:");
+      Serial.println(relayState ? "1" : "0");
+    }
+   
+    // Handle alert interval adjustment commands
+    else if (command.startsWith("A:")) {
+      // Set alert interval in seconds (convert to milliseconds)
+      int seconds = command.substring(2).toInt();
+      if (seconds >= 1 && seconds <= 3600) { // Limit to 1 second to 1 hour
+        ALERT_INTERVAL = seconds * 1000L;
+        Serial.print("ACK:Alert interval set to ");
+        Serial.print(seconds);
+        Serial.println(" seconds");
+      }
+    }
+  }
+}
+
+
+
+
+String getSoilMoistureStatus(int value) {
+  if (value > DRY_VALUE) return F("Dry");
+  if (value > WET_VALUE) return F("Medium");
+  return F("Wet");
+}
+
+
+
+
+String getPlantStatusMessage(int value) {
+  if (value > DRY_VALUE) return F("Needs Water");
+  if (value > WET_VALUE) return F("Doing Well");
+  return F("Doing Great");
+}
+
+
+
+
+// Modified to work with the ultrasonic thresholds in cm
+String getWaterLevelStatus(float distance) {
+  if (distance == 0 || distance < lowThreshold) {
+    return "Full";
+  } else if (distance < mediumThreshold) {
+    return "Medium";
+  } else {
+    return "Low";
+  }
+}
