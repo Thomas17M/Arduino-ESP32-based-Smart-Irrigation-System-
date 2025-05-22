@@ -1,0 +1,212 @@
+ESP32 Code- 
+
+LUI8_0edvTjCQ-sXTeuikVHFAbF_PRap //Back-up Blynk Authentication Token (Extra Account)
+
+#include <WiFi.h>
+#include <BlynkSimpleEsp32.h>
+#include <HTTPClient.h>
+#include <UrlEncode.h>
+
+
+// Blynk Authentication Token
+#define BLYNK_AUTH_TOKEN "4HpcJdzE1viAKZNCi27tOSdsq1rBx3TZ"
+
+
+// WiFi Credentials
+#define WIFI_SSID "Irrigation_System"
+#define WIFI_PASS "CET/EET@2025"
+
+
+// WhatsApp Notification Configuration
+
+
+String phoneNumber = "+164697500";
+String apiKey = "2792021";
+
+
+// Use HardwareSerial instead of SoftwareSerial
+HardwareSerial arduinoComm(1); // Use UART1 (can be RX2/TX2)
+
+
+// Blynk Virtual Pins
+#define V0_SOIL_SENSOR    V0  // Soil moisture sensor
+#define V1_ULTRASONIC     V1  // Ultrasonic sensor (water level)
+#define V2_RELAY          V2  // Relay control
+#define V3_TEMPERATURE    V3  // Temperature sensor
+#define V4_HUMIDITY       V4  // Humidity sensor
+
+
+// Variables to store sensor values and relay state
+int soilMoisture = 0;
+int humidity = 0;
+float temperature = 0;
+int waterLevelPercent = 0;
+String waterStatus = "";
+int relayState = 0;
+unsigned long lastRelayCommand = 0;
+bool waitingForAck = false;
+unsigned long lastStatusReport = 0;
+unsigned long lastWaterWarning = 0;
+unsigned long reportInterval = 60000; // Default 1 minute (60000ms)
+
+
+// Function to send WhatsApp message
+void sendWhatsApp(String message) {
+  // Data to send with HTTP POST
+  String url = "https://api.callmebot.com/whatsapp.php?phone=" + phoneNumber + "&apikey=" + apiKey + "&text=" + urlEncode(message);
+  HTTPClient http;
+  http.begin(url);
+
+
+  // Specify content-type header
+  http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+
+
+  // Send HTTP POST request
+  int httpResponseCode = http.POST(url);
+  if (httpResponseCode == 200) {
+    Serial.println("WhatsApp message sent successfully");
+  } else {
+    Serial.println("Error sending WhatsApp message");
+    Serial.print("HTTP response code: ");
+    Serial.println(httpResponseCode);
+  }
+
+
+  // Free resources
+  http.end();
+}
+
+
+// Blynk Virtual Pin Handler for Relay Control
+BLYNK_WRITE(V2_RELAY) {
+  int newRelayState = param.asInt();
+  if (!waitingForAck || (millis() - lastRelayCommand > 1000)) {
+    relayState = newRelayState;
+    arduinoComm.print("R:");
+    arduinoComm.println(relayState);
+    lastRelayCommand = millis();
+    waitingForAck = true;
+  }
+}
+
+
+// Send system status via WhatsApp
+void sendSystemStatusReport() {
+  if (millis() - lastStatusReport < reportInterval) return;
+ 
+  String status = "🌱 Irrigation System Status Report 🌱\n\n";
+ 
+  // Temperature status
+  status += "🌡️ Temperature: " + String(temperature, 1) + "°C\n\n";
+ 
+  // Humidity status
+  status += "💧 Humidity: " + String(humidity) + "%\n\n";
+ 
+  // Soil moisture interpretation
+  if (soilMoisture > 300) {
+    status += "🌵 Soil: Dry - Needs Water!\n\n";
+  } else if (soilMoisture > 850) {
+    status += "🌿 Soil: Medium\n\n";
+  } else {
+    status += "💦 Soil: Wet - Doing Great\n\n";
+  }
+ 
+  // Water level status from ultrasonic
+  status += "🚰 Water Tank: " + waterStatus + " (" + String(waterLevelPercent) + "%)\n\n";
+ 
+  // Add pump status
+  status += "⚙️ Pump is " + String(relayState ? "ON" : "OFF");
+ 
+  sendWhatsApp(status);
+  lastStatusReport = millis();
+}
+
+
+// Water level warning notification
+void sendWaterLevelWarning() {
+  // Only send water warning every hour to avoid spam
+  if (millis() - lastWaterWarning < 3600000) return;
+ 
+  if (waterStatus == "Low") {
+    sendWhatsApp("⚠️ ALERT: Water Level Low! Please refill your plant system's water tank soon.");
+    lastWaterWarning = millis();
+  }
+}
+
+
+void processSensorData() {
+  while (arduinoComm.available()) {
+    String data = arduinoComm.readStringUntil('\n');
+   
+    if (data.startsWith("T:")) {
+      temperature = data.substring(2).toFloat();
+      Blynk.virtualWrite(V3_TEMPERATURE, temperature);
+    }
+    else if (data.startsWith("H:")) {
+      humidity = data.substring(2).toInt();
+      Blynk.virtualWrite(V4_HUMIDITY, humidity);
+    }
+    else if (data.startsWith("S:")) {
+      soilMoisture = data.substring(2).toInt();
+      Blynk.virtualWrite(V0_SOIL_SENSOR, soilMoisture);
+     
+      // Check for critical soil moisture
+      if (soilMoisture > 300) {
+        // Very dry soil alert via WhatsApp
+        if (millis() - lastStatusReport > 1800000) { // 30 min minimum between alerts
+          sendWhatsApp("⚠️ URGENT: Soil is very dry! Plant needs water immediately!");
+          lastStatusReport = millis();
+        }
+      }
+    }
+    else if (data.startsWith("U:")) {
+      int separatorPos = data.indexOf("|");
+      if (separatorPos > 0) {
+        waterLevelPercent = data.substring(2, separatorPos).toInt();
+        waterStatus = data.substring(separatorPos + 1);
+        Blynk.virtualWrite(V1_ULTRASONIC, waterLevelPercent);
+       
+        // Check for water level warnings
+        if (waterStatus == "Low") {
+          sendWaterLevelWarning();
+        }
+      }
+    }
+    else if (data.startsWith("ACK:")) {
+      waitingForAck = false;
+     
+      if (data.length() <= 6) {
+        Blynk.virtualWrite(V2_RELAY, data.substring(4).toInt());
+      }
+    }
+  }
+ 
+  // Check if we should send the regular status report
+  sendSystemStatusReport();
+}
+
+
+void setup() {
+  Serial.begin(115200);
+  arduinoComm.begin(9600, SERIAL_8N1, 16, 17);
+ 
+  // Connect to Blynk
+  Blynk.begin(BLYNK_AUTH_TOKEN, WIFI_SSID, WIFI_PASS);
+ 
+  // Send initial WhatsApp message
+  sendWhatsApp("🌱 Your Irrigation System is now online! You'll receive status updates every minute.");
+}
+
+
+void loop() {
+  Blynk.run();
+  processSensorData();
+ 
+  // Retry relay command if no acknowledgment
+  if (waitingForAck && (millis() - lastRelayCommand > 1000)) {
+    arduinoComm.print("R:");
+    arduinoComm.println(relayState);
+    lastRelayCommand = millis();
+  }
+}
